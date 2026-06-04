@@ -7,7 +7,9 @@ No restart of the target. Stdlib only.
 
 import argparse
 import collections
+import ctypes
 import curses
+import glob
 import json
 import re
 import shutil
@@ -255,6 +257,282 @@ def nvidia_query_compute_apps():
     return rows
 
 
+# ─────────────────────────────────────────────────── PCIe ──
+#
+# vllmtop is a passive monitor, so we cannot measure true cudaMemcpy round-trip
+# latency. We surface three proxies that move in lockstep with it:
+#   • Rx/Tx MB/s          (live throughput, tail of `nvidia-smi dmon -s te`)
+#   • saturation %         (max(rx,tx) / theoretical link bw — queuing-delay proxy)
+#   • PCIe replays /s      (`pci` column from dmon — every replay = a latency tax)
+#   • AER correctable Δ    (cumulative `aer_dev_correctable` delta — link health)
+
+# Per-lane per-direction throughput in MB/s. Gen3+ uses 128b/130b encoding.
+_PCIE_LANE_MBPS = {
+    1: 250.0,    # Gen1: 2.5 GT/s · 8b/10b
+    2: 500.0,    # Gen2: 5.0 GT/s · 8b/10b
+    3: 985.0,    # Gen3: 8.0 GT/s · 128b/130b
+    4: 1969.0,   # Gen4: 16  GT/s · 128b/130b
+    5: 3938.0,   # Gen5: 32  GT/s · 128b/130b
+    6: 7563.0,   # Gen6: 64  GT/s · PAM4 + FLIT
+}
+
+
+def pcie_theoretical_mbps(gen, width):
+    """Per-direction theoretical bandwidth in MB/s for a PCIe gen×width link."""
+    if not gen or not width:
+        return 0.0
+    return _PCIE_LANE_MBPS.get(int(gen), 0.0) * int(width)
+
+
+def read_aer_correctable_total(bdf):
+    """Sum AER correctable error counts for one PCI device, or None if unreadable.
+
+    File format: lines of '<ErrName> <count>'. Readable as a normal user on
+    modern kernels (since the AER attributes are mode 0444).
+    """
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/aer_dev_correctable") as f:
+            total = 0
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        total += int(parts[1])
+                    except ValueError:
+                        continue
+            return total
+    except OSError:
+        return None
+
+
+def discover_gpu_bdfs():
+    """Return {gpu_index: 'DDDD:BB:DD.F'} mapping suitable for /sys/bus/pci/devices/."""
+    out = _smi_run([
+        "--query-gpu=index,pci.bus_id",
+        "--format=csv,noheader",
+    ])
+    if not out:
+        return {}
+    bdfs = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            continue
+        # nvidia-smi reports '00000000:04:00.0' — sysfs uses '0000:04:00.0'.
+        bid = parts[1].lower()
+        if len(bid) > 12 and bid.startswith("0000"):
+            bid = bid[4:]
+        bdfs[idx] = bid
+    return bdfs
+
+
+# NVML constants we care about
+_NVML_PCIE_UTIL_TX_BYTES = 0   # nvmlPcieUtilCounter_t
+_NVML_PCIE_UTIL_RX_BYTES = 1
+_NVML_SUCCESS = 0
+
+
+class NvmlPcieSampler:
+    """Sub-tick PCIe throughput sampler via libnvidia-ml.so (no nvidia-smi fork).
+
+    Each `nvmlDeviceGetPcieThroughput` call returns a KB/s value averaged over
+    the last 20 ms and blocks for ~20 ms while it collects the window. By
+    polling in a tight background loop we get one fresh 20-ms-window sample
+    per GPU per direction roughly every 80 ms (4 calls × 20 ms = 80 ms for two
+    GPUs), i.e. ~6 samples per GPU per 500 ms tick. Peak across those samples
+    is what queuing-latency-proxy `sat` is computed against.
+    """
+
+    def __init__(self):
+        self._rings = {}                     # idx -> deque[(ts, rx_kbps, tx_kbps)]
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._lib = None
+        self._handles = []                   # list of (idx, ctypes.c_void_p handle)
+        self.status = "init"
+
+    # ── public API ────────────────────────────────────────────────
+    def start(self):
+        try:
+            lib = ctypes.CDLL("libnvidia-ml.so.1")
+        except OSError as e:
+            self.status = f"libnvidia-ml not found: {e}"
+            return
+        # Declare prototypes (defensive; argtypes prevents pointer truncation on 64-bit).
+        lib.nvmlInit_v2.restype = ctypes.c_int
+        lib.nvmlShutdown.restype = ctypes.c_int
+        lib.nvmlDeviceGetCount_v2.argtypes = [ctypes.POINTER(ctypes.c_uint)]
+        lib.nvmlDeviceGetCount_v2.restype = ctypes.c_int
+        lib.nvmlDeviceGetHandleByIndex_v2.argtypes = [
+            ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+        lib.nvmlDeviceGetHandleByIndex_v2.restype = ctypes.c_int
+        lib.nvmlDeviceGetPcieThroughput.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint)]
+        lib.nvmlDeviceGetPcieThroughput.restype = ctypes.c_int
+
+        rc = lib.nvmlInit_v2()
+        if rc != _NVML_SUCCESS:
+            self.status = f"nvmlInit_v2 rc={rc}"
+            return
+        count = ctypes.c_uint()
+        if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != _NVML_SUCCESS:
+            lib.nvmlShutdown()
+            self.status = "nvmlDeviceGetCount failed"
+            return
+        for i in range(count.value):
+            h = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(h)) != _NVML_SUCCESS:
+                continue
+            self._handles.append((i, h))
+            # Ring of ~5 s at typical sample cadence; sub-tick queries pull from the tail.
+            self._rings[i] = collections.deque(maxlen=128)
+        self._lib = lib
+        self._thread = threading.Thread(target=self._run, daemon=True, name="nvml-pcie")
+        self._thread.start()
+        self.status = f"active ({len(self._handles)} GPUs)"
+
+    def stop(self):
+        self._stop.set()
+        # Don't call nvmlShutdown here — _run holds the lib; let the thread exit cleanly.
+
+    def window_stats(self, idx, window_s):
+        """Return dict {rx_peak, rx_mean, rx_last, tx_peak, tx_mean, tx_last,
+        n_samples} in MB/s for the given GPU index over the last window_s seconds.
+        Returns None if we have no samples for this GPU.
+        """
+        with self._lock:
+            ring = self._rings.get(idx)
+            if not ring:
+                return None
+            now = time.time()
+            cutoff = now - window_s
+            recent = [s for s in ring if s[0] >= cutoff]
+            if not recent:
+                recent = [ring[-1]]
+        rxs = [s[1] for s in recent]
+        txs = [s[2] for s in recent]
+        return {
+            "rx_peak": max(rxs) / 1000.0,
+            "rx_mean": sum(rxs) / len(rxs) / 1000.0,
+            "rx_last": recent[-1][1] / 1000.0,
+            "tx_peak": max(txs) / 1000.0,
+            "tx_mean": sum(txs) / len(txs) / 1000.0,
+            "tx_last": recent[-1][2] / 1000.0,
+            "n_samples": len(recent),
+        }
+
+    # ── sampler thread ────────────────────────────────────────────
+    def _run(self):
+        tx_val = ctypes.c_uint()
+        rx_val = ctypes.c_uint()
+        try:
+            while not self._stop.is_set():
+                for idx, h in self._handles:
+                    rc = self._lib.nvmlDeviceGetPcieThroughput(
+                        h, _NVML_PCIE_UTIL_TX_BYTES, ctypes.byref(tx_val))
+                    tx_kbps = tx_val.value if rc == _NVML_SUCCESS else 0
+                    rc = self._lib.nvmlDeviceGetPcieThroughput(
+                        h, _NVML_PCIE_UTIL_RX_BYTES, ctypes.byref(rx_val))
+                    rx_kbps = rx_val.value if rc == _NVML_SUCCESS else 0
+                    with self._lock:
+                        self._rings[idx].append((time.time(), rx_kbps, tx_kbps))
+                # No sleep needed: each nvml call already blocks ~20 ms.
+        except Exception:
+            pass
+        finally:
+            try:
+                self._lib.nvmlShutdown()
+            except Exception:
+                pass
+            self.status = "stopped"
+
+
+# ─────────────────────────────────────────────────── CPU temp ──
+
+SENSORS_BIN = shutil.which("sensors")
+
+
+def _read_hwmon_cpu_temp():
+    """Read CPU temperature from /sys/class/hwmon/hwmon*/temp*_input."""
+    cpu_drivers = {"k10temp", "coretemp", "cpu_thermal", "zenpower"}
+    temps = []
+    for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(hwmon + "/name") as f:
+                devname = f.read().strip().lower()
+        except OSError:
+            continue
+        if devname not in cpu_drivers:
+            continue
+        for temp_path in glob.glob(hwmon + "/temp*_input"):
+            try:
+                with open(temp_path) as f:
+                    raw = f.read().strip()
+                temps.append(int(raw) / 1e3)
+            except (OSError, ValueError):
+                continue
+    return temps if temps else None
+
+
+def _read_sysfs_cpu_temp():
+    """Read CPU temperature from /sys/class/thermal/thermal_zone*/temp."""
+    temps = []
+    for zone_path in glob.glob("/sys/class/thermal/thermal_zone*"):
+        type_path = zone_path + "/type"
+        temp_path = zone_path + "/temp"
+        try:
+            with open(type_path) as f:
+                ztype = f.read().strip().lower()
+            if "cpu" not in ztype and "x86" not in ztype:
+                continue
+            with open(temp_path) as f:
+                raw = f.read().strip()
+            temps.append(int(raw) / 1e3)
+        except (OSError, ValueError):
+            continue
+    return temps if temps else None
+
+
+def _read_sensors_cpu_temp():
+    """Read CPU temperature via the `sensors` command."""
+    if not SENSORS_BIN:
+        return None
+    try:
+        cp = subprocess.run([SENSORS_BIN], capture_output=True, text=True, timeout=1.0)
+        if cp.returncode != 0:
+            return None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    temps = []
+    for line in cp.stdout.splitlines():
+        low = line.lower()
+        if "core" in low or "cpu" in low:
+            m = re.search(r"([+-]?\d+\.?\d*)\s*[°\xb0]?\s*c", low)
+            if m:
+                try:
+                    temps.append(float(m.group(1)))
+                except ValueError:
+                    pass
+    return temps if temps else None
+
+
+def get_cpu_temps():
+    """Return list of CPU core temperatures (°C), or None if unavailable."""
+    temps = _read_hwmon_cpu_temp()
+    if temps is not None:
+        return temps
+    temps = _read_sysfs_cpu_temp()
+    if temps is not None:
+        return temps
+    temps = _read_sensors_cpu_temp()
+    return temps
+
+
 # ─────────────────────────────────────────────────── docker ──
 
 DOCKER = shutil.which("docker")
@@ -470,6 +748,10 @@ class State:
     gpu_rows: list = field(default_factory=list)
     gpu_apps: list = field(default_factory=list)
     gpu_stale_ts: float = 0.0
+
+    pcie_sampler: Optional["NvmlPcieSampler"] = None
+    gpu_bdfs: dict = field(default_factory=dict)
+    pcie_aer_baseline: dict = field(default_factory=dict)
 
     log_buf: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
     log_tailer: Optional[LogTailer] = None
@@ -709,6 +991,8 @@ CP_PLOT_A = 6   # green   (series 1)
 CP_PLOT_B = 7   # cyan    (series 2)
 CP_PLOT_C = 8   # yellow  (series 3)
 CP_PLOT_D = 9   # magenta (series 4)
+CP_PLOT_E = 10  # blue    (series 5)
+CP_PLOT_F = 11  # red     (series 6)
 
 
 def init_colors():
@@ -725,6 +1009,8 @@ def init_colors():
         curses.init_pair(CP_PLOT_B, curses.COLOR_CYAN, -1)
         curses.init_pair(CP_PLOT_C, curses.COLOR_YELLOW, -1)
         curses.init_pair(CP_PLOT_D, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(CP_PLOT_E, curses.COLOR_BLUE, -1)
+        curses.init_pair(CP_PLOT_F, curses.COLOR_RED, -1)
     return has_color
 
 
@@ -1254,8 +1540,8 @@ def _vllm_gpu_indices(state):
     return sorted({r["index"] for r in rows if r["uuid"] in vllm_uuids})
 
 
-def _mean_series(state, key_pattern, indices):
-    """Build a deque of mean-across-GPUs values from per-GPU history.
+def _reduce_series(state, key_pattern, indices, reducer):
+    """Build a deque by applying `reducer(list)` per-tick across per-GPU history.
 
     Aligns by tail (latest sample) and returns the min-length intersection.
     """
@@ -1265,11 +1551,19 @@ def _mean_series(state, key_pattern, indices):
         return collections.deque(maxlen=240)
     n = min(len(d) for d in dqs)
     out = collections.deque(maxlen=240)
-    # Slice each deque from the right
     sliced = [list(d)[-n:] for d in dqs]
     for i in range(n):
-        out.append(sum(s[i] for s in sliced) / len(sliced))
+        out.append(reducer([s[i] for s in sliced]))
     return out
+
+
+def _mean_series(state, key_pattern, indices):
+    return _reduce_series(state, key_pattern, indices,
+                          lambda vs: sum(vs) / len(vs))
+
+
+def _max_series(state, key_pattern, indices):
+    return _reduce_series(state, key_pattern, indices, max)
 
 
 def draw_graphs_panel(stdscr, y, x, w, state, h_budget):
@@ -1314,11 +1608,12 @@ def draw_graphs_panel(stdscr, y, x, w, state, h_budget):
     if eng_specs:
         all_plots.append(("engine", eng_specs, eng_right_axis))
 
-    # ── single mean-of-GPUs plot ──
+    # ── single mean-of-GPUs plot (util / mem / temp / cpu / PCIe sat) ──
     if gpu_indices:
-        mean_util = _mean_series(state, "gpu_{}_util", gpu_indices)
-        mean_mem  = _mean_series(state, "gpu_{}_mem",  gpu_indices)
-        mean_temp = _mean_series(state, "gpu_{}_temp", gpu_indices)
+        mean_util = _mean_series(state, "gpu_{}_util",     gpu_indices)
+        mean_mem  = _mean_series(state, "gpu_{}_mem",      gpu_indices)
+        mean_temp = _mean_series(state, "gpu_{}_temp",     gpu_indices)
+        max_sat   = _max_series(state,  "gpu_{}_pcie_sat", gpu_indices)
         gpu_specs = []
         if len(mean_util) >= 2:
             gpu_specs.append(("util", attr(CP_PLOT_A), 100.0, _pct, mean_util))
@@ -1326,6 +1621,12 @@ def draw_graphs_panel(stdscr, y, x, w, state, h_budget):
             gpu_specs.append(("mem",  attr(CP_PLOT_B), 100.0, _pct, mean_mem))
         if len(mean_temp) >= 2:
             gpu_specs.append(("temp", attr(CP_PLOT_C), 100.0, _temp, mean_temp))
+        # CPU temp overlaid on the GPU plot
+        cpu_temp_dq = state.graph_history.get("cpu_temp")
+        if cpu_temp_dq and len(cpu_temp_dq) >= 2:
+            gpu_specs.append(("cpu", attr(CP_PLOT_D), 100.0, _temp, cpu_temp_dq))
+        if len(max_sat) >= 2:
+            gpu_specs.append(("pcie", attr(CP_PLOT_E), 100.0, _pct, max_sat))
         if gpu_specs:
             n_gpus = len(gpu_indices)
             title = f"GPUs (mean ×{n_gpus})" if n_gpus > 1 else f"GPU{gpu_indices[0]}"
@@ -1407,6 +1708,45 @@ def draw_gpu_panel(stdscr, y, x, w, state, h_budget):
         if mem_pct >= 95:
             # repaint name highlight
             addstr_safe(stdscr, y + written, x + 4, f"{r['name'][:16]:<16}", color_for_mem_pct(mem_pct))
+        written += 1
+
+        # PCIe sub-line: per-tick rx/tx (last / peak / mean MB/s), saturation, AER.
+        if written >= budget:
+            continue
+        rx_last = r.get("pcie_rx_last")
+        tx_last = r.get("pcie_tx_last")
+        rx_peak = r.get("pcie_rx_peak")
+        tx_peak = r.get("pcie_tx_peak")
+        rx_mean = r.get("pcie_rx_mean")
+        tx_mean = r.get("pcie_tx_mean")
+        sat = r.get("pcie_sat_pct", 0.0)
+        aer = r.get("pcie_aer_delta", 0)
+        theo = r.get("pcie_theo_mbps", 0.0)
+        n = r.get("pcie_n_samples", 0)
+        if rx_last is None and tx_last is None and not r.get("pcie_aer_delta"):
+            sub = f"    PCIe  [{(state.pcie_sampler.status if state.pcie_sampler else 'off')}]"
+            addstr_safe(stdscr, y + written, x, sub, attr(CP_DIM))
+        else:
+            theo_s = f" / {int(theo)}" if theo else ""
+            rx_s = (f"Rx {int(rx_last):>4} ▲{int(rx_peak):>4} μ{int(rx_mean):>4}"
+                    if rx_last is not None else "Rx  ----")
+            tx_s = (f"Tx {int(tx_last):>4} ▲{int(tx_peak):>4} μ{int(tx_mean):>4}"
+                    if tx_last is not None else "Tx  ----")
+            sub_left = f"    PCIe  {rx_s}  {tx_s} MB/s{theo_s}  "
+            addstr_safe(stdscr, y + written, x, sub_left, attr(CP_DIM))
+            col2 = x + len(sub_left)
+            sat_s = f"sat ▲{sat:5.1f}%"
+            sat_col = (attr(CP_BAD) if sat >= 95 else
+                       attr(CP_WARN) if sat >= 80 else
+                       attr(CP_DIM))
+            addstr_safe(stdscr, y + written, col2, sat_s, sat_col)
+            col2 += len(sat_s) + 2
+            aer_s = f"AER +{aer}"
+            aer_col = attr(CP_WARN) if aer > 0 else attr(CP_DIM)
+            addstr_safe(stdscr, y + written, col2, aer_s, aer_col)
+            col2 += len(aer_s) + 2
+            n_s = f"(n={n})"
+            addstr_safe(stdscr, y + written, col2, n_s, attr(CP_DIM))
         written += 1
 
     # Compute apps subsection
@@ -1624,6 +1964,11 @@ def run_tui(stdscr, state):
     if not state.no_logs and state.log_tailer is None:
         _rebind_log_tailer(state)
 
+    # Host-level PCIe telemetry: NVML sub-tick throughput sampler + AER counters.
+    state.gpu_bdfs = discover_gpu_bdfs()
+    state.pcie_sampler = NvmlPcieSampler()
+    state.pcie_sampler.start()
+
     last_render = 0.0
     tick_ms = max(100, int(state.tick * 1000))
     stdscr.timeout(tick_ms)
@@ -1651,14 +1996,50 @@ def run_tui(stdscr, state):
             gpus = nvidia_query_gpu()
             apps = nvidia_query_compute_apps()
             if gpus is not None:
+                sampler = state.pcie_sampler
+                for r in gpus:
+                    idx = r["index"]
+                    state.push_graph(f"gpu_{idx}_util", r["util"])
+                    state.push_graph(f"gpu_{idx}_mem", r["mem_used"] / r["mem_total"] * 100.0 if r["mem_total"] > 0 else 0.0)
+                    state.push_graph(f"gpu_{idx}_temp", r["temp"])
+
+                    # PCIe theoretical (gen×width) for saturation calc
+                    theo = pcie_theoretical_mbps(r["pcie_gen"], r["pcie_width"])
+                    r["pcie_theo_mbps"] = theo
+
+                    stats = sampler.window_stats(idx, state.tick) if sampler else None
+                    if stats:
+                        r["pcie_rx_last"] = stats["rx_last"]
+                        r["pcie_rx_mean"] = stats["rx_mean"]
+                        r["pcie_rx_peak"] = stats["rx_peak"]
+                        r["pcie_tx_last"] = stats["tx_last"]
+                        r["pcie_tx_mean"] = stats["tx_mean"]
+                        r["pcie_tx_peak"] = stats["tx_peak"]
+                        r["pcie_n_samples"] = stats["n_samples"]
+                        peak = max(stats["rx_peak"], stats["tx_peak"])
+                        sat = (peak / theo * 100.0) if theo > 0 else 0.0
+                        r["pcie_sat_pct"] = sat
+                        state.push_graph(f"gpu_{idx}_pcie_rx_peak", stats["rx_peak"])
+                        state.push_graph(f"gpu_{idx}_pcie_tx_peak", stats["tx_peak"])
+                        state.push_graph(f"gpu_{idx}_pcie_sat", sat)
+
+                    # AER correctable cumulative delta (link-health latency proxy)
+                    bdf = state.gpu_bdfs.get(idx)
+                    if bdf:
+                        cur = read_aer_correctable_total(bdf)
+                        if cur is not None:
+                            base = state.pcie_aer_baseline.setdefault(idx, cur)
+                            r["pcie_aer_delta"] = cur - base
+
                 state.gpu_rows = gpus
                 state.gpu_stale_ts = now
-                for r in gpus:
-                    state.push_graph(f"gpu_{r['index']}_util", r["util"])
-                    state.push_graph(f"gpu_{r['index']}_mem", r["mem_used"] / r["mem_total"] * 100.0 if r["mem_total"] > 0 else 0.0)
-                    state.push_graph(f"gpu_{r['index']}_temp", r["temp"])
             if apps is not None:
                 state.gpu_apps = apps
+
+            # CPU temperature
+            cpu_temps = get_cpu_temps()
+            if cpu_temps is not None:
+                state.push_graph("cpu_temp", max(cpu_temps))
 
         try:
             render(stdscr, state)
@@ -1705,6 +2086,9 @@ def run_tui(stdscr, state):
             continue
     except KeyboardInterrupt:
         return 0
+    finally:
+        if state.pcie_sampler:
+            state.pcie_sampler.stop()
 
 
 def main():
