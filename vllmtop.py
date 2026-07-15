@@ -11,6 +11,7 @@ import ctypes
 import curses
 import glob
 import json
+import os
 import re
 import shutil
 import socket
@@ -198,7 +199,8 @@ def _smi_run(args, timeout=0.8):
 def nvidia_query_gpu():
     out = _smi_run([
         "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,"
-        "temperature.gpu,power.draw,pcie.link.gen.current,pcie.link.width.current",
+        "temperature.gpu,power.draw,clocks.current.sm,"
+        "pcie.link.gen.current,pcie.link.width.current",
         "--format=csv,noheader,nounits",
     ])
     if out is None:
@@ -206,7 +208,7 @@ def nvidia_query_gpu():
     rows = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 10:
+        if len(parts) < 11:
             continue
         def _f(s, default=0.0):
             try:
@@ -227,8 +229,9 @@ def nvidia_query_gpu():
             "mem_total": _f(parts[5]),
             "temp": _f(parts[6]),
             "power": _f(parts[7]),
-            "pcie_gen": _i(parts[8]),
-            "pcie_width": _i(parts[9]),
+            "clock": _i(parts[8]),
+            "pcie_gen": _i(parts[9]),
+            "pcie_width": _i(parts[10]),
         })
     return rows
 
@@ -616,10 +619,82 @@ SPECDEC_RE = re.compile(
 )
 
 
+
+class LogRotator:
+    """Manages log file rotation based on model changes."""
+    
+    def __init__(self, log_dir="logs"):
+        self.log_dir = log_dir
+        self.current_model = None
+        self.active_file = None
+        self.lock = threading.Lock()
+        self._ensure_log_dir()
+    
+    def _ensure_log_dir(self):
+        """Create log directory if it doesn't exist."""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except OSError as e:
+            pass  # Silently ignore errors
+    
+    def _close_file(self):
+        """Internal: close the current log file without acquiring lock."""
+        if self.active_file:
+            try:
+                self.active_file.close()
+            except OSError:
+                pass
+            self.active_file = None
+    
+    def set_model(self, model_id):
+        """Rotate to a new model if model_id changed."""
+        with self.lock:
+            if model_id == self.current_model:
+                return
+            
+            # Close current file if open
+            self._close_file()
+            
+            self.current_model = model_id
+            if not model_id:
+                return
+            
+            # Open new log file
+            log_filename = os.path.join(self.log_dir, f"{model_id}.log")
+            try:
+                self.active_file = open(log_filename, 'a', buffering=1)  # line buffered
+            except OSError:
+                self.active_file = None
+    
+    def write(self, line):
+        """Write a line to the current model's log file."""
+        with self.lock:
+            if self.active_file:
+                try:
+                    self.active_file.write(line)
+                    self.active_file.flush()
+                except OSError:
+                    pass
+    
+    def close(self):
+        """Close the current log file."""
+        with self.lock:
+            self._close_file()
+    
+    @property
+    def status(self):
+        """Return current status string."""
+        if self.current_model:
+            if self.active_file:
+                return "tailing"
+            return "rotated"
+        return "idle"
+
 class LogTailer:
-    def __init__(self, container, buffer):
+    def __init__(self, container, buffer, log_rotator=None):
         self.container = container
         self.buffer = buffer
+        self.log_rotator = log_rotator
         self.stop_flag = threading.Event()
         self.thread = None
         self.proc = None
@@ -674,6 +749,9 @@ class LogTailer:
 
     def _parse_line(self, line):
         ts = time.strftime("%H:%M:%S")
+        # Write to log rotator if available
+        if self.log_rotator:
+            self.log_rotator.write(line)
         m = ENGINE_RE.search(line)
         if m:
             self.buffer.append({
@@ -754,6 +832,8 @@ class State:
     pcie_aer_baseline: dict = field(default_factory=dict)
 
     log_buf: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
+    log_rotator: Optional["LogRotator"] = None
+    current_model: str = ""
     log_tailer: Optional[LogTailer] = None
 
     # Time-series buffers for graphs (one float per tick; capped at 240 samples = 4 min @ 1 s).
@@ -763,6 +843,7 @@ class State:
     err_msg: str = ""
     start_ts: float = field(default_factory=time.time)
     gen_tps_global_max: float = 0.0
+    gpu_clock_global_max: float = 0.0
 
     def push_graph(self, name, value):
         dq = self.graph_history.setdefault(name, collections.deque(maxlen=240))
@@ -833,6 +914,7 @@ class State:
         self.counter_history.clear()
         self.hist_history.clear()
         self.gen_tps_global_max = 0.0
+        self.gpu_clock_global_max = 0.0
 
 
 def fetch_sample(url, timeout=2.0):
@@ -1327,6 +1409,10 @@ def draw_header(stdscr, y, x, w, state):
         extras.append((state.err_msg, attr(CP_BAD)))
     if state.no_logs:
         extras.append(("logs: disabled (--no-logs)", attr(CP_DIM)))
+    elif state.log_rotator and state.current_model:
+        # Model-based log status
+        s = f"logs: {state.current_model} [{state.log_rotator.status}]"
+        extras.append((s, attr(CP_DIM)))
     elif state.container:
         s = f"logs: {state.container}"
         if state.log_tailer and state.log_tailer.dead:
@@ -1585,6 +1671,7 @@ def draw_graphs_panel(stdscr, y, x, w, state, h_budget):
     def _int(v):   return f"{int(round(v))}"
     def _tps(v):   return f"{v:.1f} t/s"
     def _temp(v):  return f"{int(round(v))}°C"
+    def _mhz(v):   return f"{int(round(v))}MHz"
 
     all_plots = []
 
@@ -1608,13 +1695,14 @@ def draw_graphs_panel(stdscr, y, x, w, state, h_budget):
     if eng_specs:
         all_plots.append(("engine", eng_specs, eng_right_axis))
 
-    # ── single mean-of-GPUs plot (util / mem / temp / cpu / PCIe sat) ──
+    # ── single mean-of-GPUs plot (util / mem / temp / cpu / clock) ──
     if gpu_indices:
-        mean_util = _mean_series(state, "gpu_{}_util",     gpu_indices)
-        mean_mem  = _mean_series(state, "gpu_{}_mem",      gpu_indices)
-        mean_temp = _mean_series(state, "gpu_{}_temp",     gpu_indices)
-        max_sat   = _max_series(state,  "gpu_{}_pcie_sat", gpu_indices)
+        mean_util  = _mean_series(state, "gpu_{}_util",     gpu_indices)
+        mean_mem   = _mean_series(state, "gpu_{}_mem",      gpu_indices)
+        mean_temp  = _mean_series(state, "gpu_{}_temp",     gpu_indices)
+        mean_clock = _mean_series(state, "gpu_{}_clock",    gpu_indices)
         gpu_specs = []
+        gpu_right_axis = None
         if len(mean_util) >= 2:
             gpu_specs.append(("util", attr(CP_PLOT_A), 100.0, _pct, mean_util))
         if len(mean_mem) >= 2:
@@ -1625,12 +1713,14 @@ def draw_graphs_panel(stdscr, y, x, w, state, h_budget):
         cpu_temp_dq = state.graph_history.get("cpu_temp")
         if cpu_temp_dq and len(cpu_temp_dq) >= 2:
             gpu_specs.append(("cpu", attr(CP_PLOT_D), 100.0, _temp, cpu_temp_dq))
-        if len(max_sat) >= 2:
-            gpu_specs.append(("pcie", attr(CP_PLOT_E), 100.0, _pct, max_sat))
+        if len(mean_clock) >= 2:
+            clock_max = max(state.gpu_clock_global_max, 500)
+            gpu_specs.append(("clk", attr(CP_PLOT_F), clock_max, _mhz, mean_clock))
+            gpu_right_axis = (attr(CP_PLOT_F), clock_max, "MHz")
         if gpu_specs:
             n_gpus = len(gpu_indices)
             title = f"GPUs (mean ×{n_gpus})" if n_gpus > 1 else f"GPU{gpu_indices[0]}"
-            all_plots.append((title, gpu_specs, None))
+            all_plots.append((title, gpu_specs, gpu_right_axis))
 
     if not all_plots:
         return 0
@@ -1682,7 +1772,7 @@ def draw_gpu_panel(stdscr, y, x, w, state, h_budget):
         addstr_safe(stdscr, y, x + 10, "[no vllm GPU workers attached]", attr(CP_DIM))
         return 1
 
-    addstr_safe(stdscr, y, x, " GPU NAME            UTIL  MEM (GB)         TEMP    POWER   PCIe",
+    addstr_safe(stdscr, y, x, " GPU NAME            UTIL  MEM (GB)         TEMP    POWER   CLK    PCIe",
                 attr(CP_HEADER) | curses.A_BOLD)
     written = 1
     budget = h_budget
@@ -1702,6 +1792,8 @@ def draw_gpu_panel(stdscr, y, x, w, state, h_budget):
         col += len(temp_str) + 3
         addstr_safe(stdscr, y + written, col, f"{int(r['power']):4d} W")
         col += 7
+        addstr_safe(stdscr, y + written, col, f"{int(r['clock']):4d} MHz")
+        col += 8
         pcie = f"  Gen{r['pcie_gen']} x{r['pcie_width']}"
         addstr_safe(stdscr, y + written, col, pcie, attr(CP_DIM))
         # Color whole row by mem pct if high
@@ -1771,7 +1863,11 @@ def draw_gpu_panel(stdscr, y, x, w, state, h_budget):
 
 def draw_log_panel(stdscr, y, x, w, state, h_budget):
     title = " LOG"
-    if state.container:
+    if state.log_rotator and state.current_model:
+        # Model-based log file
+        log_file = os.path.join(state.log_rotator.log_dir, f"{state.current_model}.log")
+        title += f"  ({log_file})"
+    elif state.container:
         title += f"  (docker logs -f {state.container})"
     elif state.container_status:
         title += f"  [{state.container_status}]"
@@ -1945,8 +2041,8 @@ def _rebind_log_tailer(state):
     name, status = autodetect_container(state.url)
     state.container = name
     state.container_status = status
-    if name:
-        state.log_tailer = LogTailer(name, state.log_buf)
+    if name and state.log_rotator:
+        state.log_tailer = LogTailer(name, state.log_buf, state.log_rotator)
         state.log_tailer.start()
 
 
@@ -1986,6 +2082,11 @@ def run_tui(stdscr, state):
             sample, err = fetch_sample(state.url, timeout=max(1.0, state.tick))
             if sample:
                 update_state(state, sample)
+                # Check for model change and rotate logs if needed
+                if state.log_rotator and sample.model_id:
+                    if state.current_model != sample.model_id:
+                        state.current_model = sample.model_id
+                        state.log_rotator.set_model(sample.model_id)
                 state.err_msg = ""
             else:
                 state.err_msg = err if err else "fetch failed"
@@ -2002,6 +2103,9 @@ def run_tui(stdscr, state):
                     state.push_graph(f"gpu_{idx}_util", r["util"])
                     state.push_graph(f"gpu_{idx}_mem", r["mem_used"] / r["mem_total"] * 100.0 if r["mem_total"] > 0 else 0.0)
                     state.push_graph(f"gpu_{idx}_temp", r["temp"])
+                    state.push_graph(f"gpu_{idx}_clock", r["clock"])
+                    if r["clock"] > state.gpu_clock_global_max:
+                        state.gpu_clock_global_max = r["clock"]
 
                     # PCIe theoretical (gen×width) for saturation calc
                     theo = pcie_theoretical_mbps(r["pcie_gen"], r["pcie_width"])
@@ -2019,9 +2123,6 @@ def run_tui(stdscr, state):
                         peak = max(stats["rx_peak"], stats["tx_peak"])
                         sat = (peak / theo * 100.0) if theo > 0 else 0.0
                         r["pcie_sat_pct"] = sat
-                        state.push_graph(f"gpu_{idx}_pcie_rx_peak", stats["rx_peak"])
-                        state.push_graph(f"gpu_{idx}_pcie_tx_peak", stats["tx_peak"])
-                        state.push_graph(f"gpu_{idx}_pcie_sat", sat)
 
                     # AER correctable cumulative delta (link-health latency proxy)
                     bdf = state.gpu_bdfs.get(idx)
@@ -2081,7 +2182,7 @@ def run_tui(stdscr, state):
                 state.container = new_c
                 state.container_status = ""
                 state.log_buf.clear()
-                state.log_tailer = LogTailer(new_c, state.log_buf)
+                state.log_tailer = LogTailer(new_c, state.log_buf, state.log_rotator)
                 state.log_tailer.start()
             continue
     except KeyboardInterrupt:
@@ -2116,6 +2217,9 @@ def main():
     elif args.no_logs:
         container_status = "disabled by --no-logs"
 
+    # Initialize log rotator for model-based logging
+    log_rotator = LogRotator() if not args.no_logs else None
+
     state = State(
         url=url,
         container=container,
@@ -2123,10 +2227,11 @@ def main():
         tick=tick,
         debug_log=args.debug,
         no_logs=args.no_logs,
+        log_rotator=log_rotator,
     )
 
-    if container and not args.no_logs:
-        state.log_tailer = LogTailer(container, state.log_buf)
+    if container and not args.no_logs and log_rotator:
+        state.log_tailer = LogTailer(container, state.log_buf, log_rotator)
         state.log_tailer.start()
 
     rc = 0
@@ -2137,6 +2242,8 @@ def main():
     finally:
         if state.log_tailer:
             state.log_tailer.stop()
+        if state.log_rotator:
+            state.log_rotator.close()
     sys.exit(rc or 0)
 
 
